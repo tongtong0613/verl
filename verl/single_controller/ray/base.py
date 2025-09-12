@@ -11,11 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import inspect
 import logging
 import socket
 from copy import deepcopy
 from typing import Any, Optional
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
 import ray
 from ray.experimental.state.api import get_actor
@@ -626,6 +629,29 @@ class RayWorkerGroup(WorkerGroup):
         return ray.get(self.execute_all_async(method_name, *args, **kwargs))
 
     def execute_all_async(self, method_name: str, *args, **kwargs):
+
+        length = len(self._workers)
+        if all(isinstance(arg, list) for arg in args) and all(isinstance(kwarg, list) for kwarg in kwargs.values()):
+            if all(len(arg) == length for arg in args) and all(len(kwarg) == length for kwarg in kwargs.values()):
+                # print(f"splitting args and kwargs into {length} shards")
+                result = []
+                import datetime
+                print("%" * 100)
+                import time
+                submitted_at = time.perf_counter()
+                for i in range(length):
+                    sliced_args = tuple(arg[i] for arg in args)
+                    sliced_kwargs = {k: v[i] for k, v in kwargs.items()}
+                    result.append(
+                        self._execute_remote_single_worker(self._workers[i], method_name, *sliced_args, **sliced_kwargs)
+                    )
+                submitted_done = time.perf_counter()
+                print(f"method-{method_name} submit 耗时: {(submitted_done - submitted_at) * 1000:.2f} ms")
+                return result
+
+        return [self._execute_remote_single_worker(worker, method_name, *args, **kwargs) for worker in self._workers]
+
+    def execute_all_async_after(self, method_name: str, *args, **kwargs):
         """Execute a method on all workers asynchronously.
 
         Args:
@@ -640,20 +666,51 @@ class RayWorkerGroup(WorkerGroup):
         # and their lengths match len(self._workers), we'll distribute each
         # element in these lists to the corresponding worker
         # print(f"execute_all_async: method {method_name}({args}, {kwargs})")
-        length = len(self._workers)
-        if all(isinstance(arg, list) for arg in args) and all(isinstance(kwarg, list) for kwarg in kwargs.values()):
-            if all(len(arg) == length for arg in args) and all(len(kwarg) == length for kwarg in kwargs.values()):
-                # print(f"splitting args and kwargs into {length} shards")
-                result = []
-                for i in range(length):
-                    sliced_args = tuple(arg[i] for arg in args)
-                    sliced_kwargs = {k: v[i] for k, v in kwargs.items()}
-                    result.append(
-                        self._execute_remote_single_worker(self._workers[i], method_name, *sliced_args, **sliced_kwargs)
-                    )
-                return result
+        # length = len(self._workers)
+        # if all(isinstance(arg, list) for arg in args) and all(isinstance(kwarg, list) for kwarg in kwargs.values()):
+        #     if all(len(arg) == length for arg in args) and all(len(kwarg) == length for kwarg in kwargs.values()):
+        #         # print(f"splitting args and kwargs into {length} shards")
+        #         result = []
+        #         for i in range(length):
+        #             sliced_args = tuple(arg[i] for arg in args)
+        #             sliced_kwargs = {k: v[i] for k, v in kwargs.items()}
+        #             import datetime
+        #             print("%" * 100)
+        #             print(f"method_name: {method_name}, worker_num: {i}")
+        #             print(datetime.datetime.now())
+        #             result.append(
+        #                 self._execute_remote_single_worker(self._workers[i], method_name, *sliced_args, **sliced_kwargs)
+        #             )
+        #         return result
+        #
+        # return [self._execute_remote_single_worker(worker, method_name, *args, **kwargs) for worker in self._workers]
 
-        return [self._execute_remote_single_worker(worker, method_name, *args, **kwargs) for worker in self._workers]
+        return asyncio.run(self._execute_all_async_impl(method_name, *args, **kwargs))
+
+    async def _execute_all_async_impl(self, method_name: str, *args, **kwargs):
+        length = len(self._workers)
+
+        if all(isinstance(arg, list) for arg in args) and all(isinstance(kwarg, list) for kwarg in kwargs.values()):
+            if not (all(len(arg) == length for arg in args) and all(len(kwarg) == length for kwarg in kwargs.values())):
+                raise ValueError(f"Argument list lengths must match number of workers ({length})")
+        else:
+            args = [args] * length
+            kwargs = {k: [v] * length for k, v in kwargs.items()}
+
+        loop = asyncio.get_event_loop()
+        futures = []
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            for i in range(length):
+                worker_args = tuple(arg[i] for arg in args)
+                worker_kwargs = {k: v[i] for k, v in kwargs.items()}
+                func = partial(self._execute_remote_single_worker, self._workers[i], method_name, *worker_args,
+                               **worker_kwargs)
+                future = loop.run_in_executor(executor, func)
+                futures.append(future)
+
+        refs = await asyncio.gather(*futures)
+        return refs
 
     @property
     def master_address(self):
